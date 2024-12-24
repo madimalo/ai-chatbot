@@ -1,34 +1,33 @@
 import 'server-only';
 
 import { genSaltSync, hashSync } from 'bcrypt-ts';
-import { and, asc, desc, eq, gt, gte } from 'drizzle-orm';
-import { drizzle } from 'drizzle-orm/postgres-js';
-import postgres from 'postgres';
+import { createClient } from '@supabase/supabase-js';
 
 import {
-  user,
-  chat,
   type User,
-  document,
   type Suggestion,
-  suggestion,
   type Message,
-  message,
-  vote,
 } from './schema';
 import { BlockKind } from '@/components/block';
 
-// Optionally, if not using email/pass login, you can
-// use the Drizzle adapter for Auth.js / NextAuth
-// https://authjs.dev/reference/adapter/drizzle
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-// biome-ignore lint: Forbidden non-null assertion.
-const client = postgres(process.env.POSTGRES_URL!);
-const db = drizzle(client);
+if (!supabaseUrl || !supabaseKey) {
+  throw new Error('Missing Supabase environment variables');
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 export async function getUser(email: string): Promise<Array<User>> {
   try {
-    return await db.select().from(user).where(eq(user.email, email));
+    const { data, error } = await supabase
+      .from('User')
+      .select('*')
+      .eq('email', email);
+    
+    if (error) throw error;
+    return data || [];
   } catch (error) {
     console.error('Failed to get user from database');
     throw error;
@@ -40,7 +39,11 @@ export async function createUser(email: string, password: string) {
   const hash = hashSync(password, salt);
 
   try {
-    return await db.insert(user).values({ email, password: hash });
+    const { error } = await supabase
+      .from('User')
+      .insert({ email, password: hash });
+    
+    if (error) throw error;
   } catch (error) {
     console.error('Failed to create user in database');
     throw error;
@@ -49,32 +52,48 @@ export async function createUser(email: string, password: string) {
 
 export async function saveChat({
   id,
-  userId,
   title,
+  userId,
+  visibility = 'private',
 }: {
   id: string;
-  userId: string;
   title: string;
+  userId: string;
+  visibility?: 'private' | 'public';
 }) {
   try {
-    return await db.insert(chat).values({
-      id,
-      createdAt: new Date(),
-      userId,
-      title,
-    });
+    const { error } = await supabase
+      .from('Chat')
+      .insert({ 
+        id, 
+        title, 
+        userId, 
+        visibility,
+        createdAt: new Date().toISOString()
+      });
+    
+    if (error) throw error;
   } catch (error) {
-    console.error('Failed to save chat in database');
+    console.error('Failed to save chat to database');
     throw error;
   }
 }
 
 export async function deleteChatById({ id }: { id: string }) {
   try {
-    await db.delete(vote).where(eq(vote.chatId, id));
-    await db.delete(message).where(eq(message.chatId, id));
+    await supabase
+      .from('Vote')
+      .delete()
+      .eq('chatId', id);
+    await supabase
+      .from('Message')
+      .delete()
+      .eq('chatId', id);
 
-    return await db.delete(chat).where(eq(chat.id, id));
+    await supabase
+      .from('Chat')
+      .delete()
+      .eq('id', id);
   } catch (error) {
     console.error('Failed to delete chat by id from database');
     throw error;
@@ -83,21 +102,29 @@ export async function deleteChatById({ id }: { id: string }) {
 
 export async function getChatsByUserId({ id }: { id: string }) {
   try {
-    return await db
-      .select()
-      .from(chat)
-      .where(eq(chat.userId, id))
-      .orderBy(desc(chat.createdAt));
+    const { data, error } = await supabase
+      .from('Chat')
+      .select('*')
+      .eq('userId', id)
+      .order('createdAt', { ascending: false });
+    
+    if (error) throw error;
+    return data || [];
   } catch (error) {
-    console.error('Failed to get chats by user from database');
+    console.error('Failed to get chats from database');
     throw error;
   }
 }
 
 export async function getChatById({ id }: { id: string }) {
   try {
-    const [selectedChat] = await db.select().from(chat).where(eq(chat.id, id));
-    return selectedChat;
+    const { data, error } = await supabase
+      .from('Chat')
+      .select('*')
+      .eq('id', id);
+    
+    if (error) throw error;
+    return data[0] || null;
   } catch (error) {
     console.error('Failed to get chat by id from database');
     throw error;
@@ -106,7 +133,11 @@ export async function getChatById({ id }: { id: string }) {
 
 export async function saveMessages({ messages }: { messages: Array<Message> }) {
   try {
-    return await db.insert(message).values(messages);
+    const { error } = await supabase
+      .from('Message')
+      .insert(messages);
+    
+    if (error) throw error;
   } catch (error) {
     console.error('Failed to save messages in database', error);
     throw error;
@@ -115,11 +146,14 @@ export async function saveMessages({ messages }: { messages: Array<Message> }) {
 
 export async function getMessagesByChatId({ id }: { id: string }) {
   try {
-    return await db
-      .select()
-      .from(message)
-      .where(eq(message.chatId, id))
-      .orderBy(asc(message.createdAt));
+    const { data, error } = await supabase
+      .from('Message')
+      .select('*')
+      .eq('chatId', id)
+      .order('createdAt', { ascending: true });
+    
+    if (error) throw error;
+    return data || [];
   } catch (error) {
     console.error('Failed to get messages by chat id from database', error);
     throw error;
@@ -136,22 +170,22 @@ export async function voteMessage({
   type: 'up' | 'down';
 }) {
   try {
-    const [existingVote] = await db
-      .select()
-      .from(vote)
-      .where(and(eq(vote.messageId, messageId)));
-
-    if (existingVote) {
-      return await db
-        .update(vote)
-        .set({ isUpvoted: type === 'up' })
-        .where(and(eq(vote.messageId, messageId), eq(vote.chatId, chatId)));
+    const { data, error } = await supabase
+      .from('Vote')
+      .select('*')
+      .eq('messageId', messageId);
+    
+    if (error) throw error;
+    if (data.length > 0) {
+      await supabase
+        .from('Vote')
+        .update({ isUpvoted: type === 'up' })
+        .eq('messageId', messageId);
+    } else {
+      await supabase
+        .from('Vote')
+        .insert({ chatId, messageId, isUpvoted: type === 'up' });
     }
-    return await db.insert(vote).values({
-      chatId,
-      messageId,
-      isUpvoted: type === 'up',
-    });
   } catch (error) {
     console.error('Failed to upvote message in database', error);
     throw error;
@@ -160,7 +194,13 @@ export async function voteMessage({
 
 export async function getVotesByChatId({ id }: { id: string }) {
   try {
-    return await db.select().from(vote).where(eq(vote.chatId, id));
+    const { data, error } = await supabase
+      .from('Vote')
+      .select('*')
+      .eq('chatId', id);
+    
+    if (error) throw error;
+    return data || [];
   } catch (error) {
     console.error('Failed to get votes by chat id from database', error);
     throw error;
@@ -181,14 +221,11 @@ export async function saveDocument({
   userId: string;
 }) {
   try {
-    return await db.insert(document).values({
-      id,
-      title,
-      kind,
-      content,
-      userId,
-      createdAt: new Date(),
-    });
+    const { error } = await supabase
+      .from('Document')
+      .insert({ id, title, kind, content, userId });
+    
+    if (error) throw error;
   } catch (error) {
     console.error('Failed to save document in database');
     throw error;
@@ -197,13 +234,14 @@ export async function saveDocument({
 
 export async function getDocumentsById({ id }: { id: string }) {
   try {
-    const documents = await db
-      .select()
-      .from(document)
-      .where(eq(document.id, id))
-      .orderBy(asc(document.createdAt));
-
-    return documents;
+    const { data, error } = await supabase
+      .from('Document')
+      .select('*')
+      .eq('id', id)
+      .order('createdAt', { ascending: true });
+    
+    if (error) throw error;
+    return data || [];
   } catch (error) {
     console.error('Failed to get document by id from database');
     throw error;
@@ -212,13 +250,14 @@ export async function getDocumentsById({ id }: { id: string }) {
 
 export async function getDocumentById({ id }: { id: string }) {
   try {
-    const [selectedDocument] = await db
-      .select()
-      .from(document)
-      .where(eq(document.id, id))
-      .orderBy(desc(document.createdAt));
-
-    return selectedDocument;
+    const { data, error } = await supabase
+      .from('Document')
+      .select('*')
+      .eq('id', id)
+      .order('createdAt', { ascending: false });
+    
+    if (error) throw error;
+    return data[0] || null;
   } catch (error) {
     console.error('Failed to get document by id from database');
     throw error;
@@ -233,18 +272,16 @@ export async function deleteDocumentsByIdAfterTimestamp({
   timestamp: Date;
 }) {
   try {
-    await db
-      .delete(suggestion)
-      .where(
-        and(
-          eq(suggestion.documentId, id),
-          gt(suggestion.documentCreatedAt, timestamp),
-        ),
-      );
-
-    return await db
-      .delete(document)
-      .where(and(eq(document.id, id), gt(document.createdAt, timestamp)));
+    await supabase
+      .from('Suggestion')
+      .delete()
+      .eq('documentId', id)
+      .gt('documentCreatedAt', timestamp.toISOString());
+    await supabase
+      .from('Document')
+      .delete()
+      .eq('id', id)
+      .gt('createdAt', timestamp.toISOString());
   } catch (error) {
     console.error(
       'Failed to delete documents by id after timestamp from database',
@@ -259,7 +296,11 @@ export async function saveSuggestions({
   suggestions: Array<Suggestion>;
 }) {
   try {
-    return await db.insert(suggestion).values(suggestions);
+    const { error } = await supabase
+      .from('Suggestion')
+      .insert(suggestions);
+    
+    if (error) throw error;
   } catch (error) {
     console.error('Failed to save suggestions in database');
     throw error;
@@ -272,10 +313,13 @@ export async function getSuggestionsByDocumentId({
   documentId: string;
 }) {
   try {
-    return await db
-      .select()
-      .from(suggestion)
-      .where(and(eq(suggestion.documentId, documentId)));
+    const { data, error } = await supabase
+      .from('Suggestion')
+      .select('*')
+      .eq('documentId', documentId);
+    
+    if (error) throw error;
+    return data || [];
   } catch (error) {
     console.error(
       'Failed to get suggestions by document version from database',
@@ -286,7 +330,13 @@ export async function getSuggestionsByDocumentId({
 
 export async function getMessageById({ id }: { id: string }) {
   try {
-    return await db.select().from(message).where(eq(message.id, id));
+    const { data, error } = await supabase
+      .from('Message')
+      .select('*')
+      .eq('id', id);
+    
+    if (error) throw error;
+    return data[0] || null;
   } catch (error) {
     console.error('Failed to get message by id from database');
     throw error;
@@ -301,11 +351,11 @@ export async function deleteMessagesByChatIdAfterTimestamp({
   timestamp: Date;
 }) {
   try {
-    return await db
-      .delete(message)
-      .where(
-        and(eq(message.chatId, chatId), gte(message.createdAt, timestamp)),
-      );
+    await supabase
+      .from('Message')
+      .delete()
+      .eq('chatId', chatId)
+      .gte('createdAt', timestamp.toISOString());
   } catch (error) {
     console.error(
       'Failed to delete messages by id after timestamp from database',
@@ -322,7 +372,10 @@ export async function updateChatVisiblityById({
   visibility: 'private' | 'public';
 }) {
   try {
-    return await db.update(chat).set({ visibility }).where(eq(chat.id, chatId));
+    await supabase
+      .from('Chat')
+      .update({ visibility })
+      .eq('id', chatId);
   } catch (error) {
     console.error('Failed to update chat visibility in database');
     throw error;
